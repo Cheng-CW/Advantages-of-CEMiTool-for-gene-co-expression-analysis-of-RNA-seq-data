@@ -1,0 +1,331 @@
+# Retrieve data from GEO
+fastq-dump --split-files SRRXXXXXXX
+
+# Perform initial QC
+fastqc /nobackup/cwc/Analyses/co_expression_comparison/raw_data/ -o /nobackup/medcwc/Analyses/co_expression_comparison/initial_QC/
+
+# Trim raw reads
+trim_galore --output_dir trimmed_reads/ --fastqc --max_n 10 --quality 20 --length 20 --illumina --stringency 6 /nobackup/medcwc/Analyses/co_expression_comparison/raw_data/*
+
+# Index reference genome
+STAR --runThreadN 12 --runMode genomeGenerate --genomeDir /nobackup/medcwc/Analyses/co_expression_comparison/reference_genome --genomeFastaFiles GCF_000001405.39_GRCh38.p13_genomic.fa --sjdbGTFfile GCF_000001405.39_GRCh38.p13_genomic.gtf --sjdbOverhang 100
+
+# Mapping for reference genome
+STAR --runThreadN 12 --runMode alignReads --outFilterMultimapNmax 1 --genomeDir /nobackup/medcwc/Analyses/co_expression_comparison/reference_genome/ --readFilesIn /nobackup/medcwc/Analyses/co_expression_comparison/trimmed_reads/SRR7426784_1_trimmed.fq --outFileNamePrefix SRR7426784_ --outSAMtype BAM SortedByCoordinate --outSAMattributes All --outSAMstrandField intronMotif --sjdbOverhang 100 --outFilterScoreMinOverLread 0 --outFilterMatchNminOverLread 0 --outFilterMatchNmin 0
+
+# FeatureCounts
+featureCounts -T 12 -t exon -g gene_id -a /nobackup/medcwc/Analyses/co_expression_comparison/reference_genome/GCF_000001405.39_GRCh38.p13_genomic.gtf -o counts.txt *_Aligned.sortedByCoord.out.bam
+
+#################################
+###########R scripts#############
+#################################
+
+######################
+#######DESeq2#########
+######################
+
+setwd("~/Desktop/")
+library("DESeq2")
+countData<-read.csv("counts.txt",sep="\t")
+metaData <- read.csv("samplesinfo.csv", header=TRUE)
+rownames(countData)<-make.names(countData$Geneid, unique = TRUE)
+countData$Geneid<-NULL
+head(countData)
+
+# PCA raw reads
+library(ggfortify)
+library(ggrepel)
+pcDat <- prcomp(t(countData))
+autoplot(pcDat, data = metaData, colour="Condition", size=5) + geom_text_repel(aes(label=metaData$Sample))
+
+# Normalise data
+dds <- DESeqDataSetFromMatrix(countData=countData, colData=metaData, design=~Batch+Condition)
+data <- dds[rowSums(DESeq2::counts(dds)) > 10, ]
+dds <- DESeq(data)
+vsdata<-vst(dds, blind=FALSE)
+
+# Plot PCA
+plotPCA(vsdata, "Batch", intgroup="Condition") + geom_text_repel(aes(label=name), size=3) + geom_point(size=1) +  theme(text = element_text(size=3)) + coord_fixed(ratio = 2)
+
+# Differential gene expression
+C_D<-results(dds)
+res <- C_D[order(C_D$padj),]
+results = as.data.frame(dplyr::mutate(as.data.frame(res), sig=ifelse(res$padj<0.05, "FDR<0.05", "Not Sig")), row.names=rownames(res))
+sum(results$padj<0.05, na.rm = T)
+summary(results)
+write.csv(results, file="DEGs.csv")
+
+# Volcano plot
+library(ggplot2)
+library(ggrepel)
+p = ggplot2::ggplot(results, ggplot2::aes(log2FoldChange, -log10(pvalue))) + ggplot2::geom_point(ggplot2::aes(col = sig)) + ggplot2::scale_color_manual(values = c("red", "black")) + geom_vline(xintercept=c(-0,0), linetype="dotted") +  theme(text = element_text(size=14))
+p + ggrepel::geom_text_repel(data=results[1:10, ], ggplot2::aes(label=rownames(results[1:10, ])))
+
+######################
+########WGCNA#########
+######################
+
+library(WGCNA)
+
+# Pick the top 5,000 variable genes based on variance
+rv <- rowVars(assay(vsdata))
+ntop <- 5000
+select <- order(rv, decreasing = TRUE)[seq_len(min(ntop, length(rv)))]
+vsd5000 <- vsdata[select,]
+vsd5000_DF<-assay(vsd5000)
+
+# Transpose the data according to WGCNA requirement
+vsd2 <- t(vsd5000_DF)
+
+# Check the samples
+gsg = goodSamplesGenes(vsd2, verbose = 3)
+gsg$allOK
+
+# Detect outliers
+datTraits = read.csv("samplesinfo2.csv")
+head(datTraits)
+rownames(datTraits) = datTraits$Sample
+library(flashClust)
+datTraits$Sample = NULL
+table(rownames(datTraits)==rownames(vsd2))
+A = adjacency(t(vsd2),type="signed")
+k = as.numeric(apply(A,2,sum))-1
+Z.k = scale(k)
+thresholdZ.k = -2.5
+outlierColor = ifelse(Z.k<thresholdZ.k,"red","black")
+sampleTree = flashClust(as.dist(1-A), method = "average")
+traitColors = data.frame(numbers2colors(datTraits,signed=FALSE))
+dimnames(traitColors)[[2]] = paste(names(datTraits))
+datColors = data.frame(outlier = outlierColor,traitColors)
+plotDendroAndColors(sampleTree, traitColors, groupLabels = names(datTraits[1:1]), main = "Sample dendrogram and trait heatmap", cex.dendroLabels = 0.7, cex.rowText = 1.0, cex.colorLabels = 1.0)
+
+# Calculate the power
+powers = c(c(1:10), seq(from = 11, to=30, by=1))
+
+# Call the network topology analysis function
+sft = pickSoftThreshold(vsd2, powerVector=powers, verbose =5, networkType="signed")
+
+# Plot the results
+sizeGrWindow(9,5)
+par(mfrow= c(1,2))
+cex1=0.9
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2], xlab= "Soft Threshold (power)", ylab="Scale Free Topology Model Fit, signed R^2", type= "n", main= paste("Scale independence"))
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2], labels=powers, cex=cex1, col="red")
+abline(h=0.90, col="red")
+plot(sft$fitIndices[,1], sft$fitIndices[,5], xlab= "Soft Threshold (power)", ylab="Mean Connectivity", type="n", main = paste("Mean connectivity"))
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=cex1, col="red")
+enableWGCNAThreads()
+
+# Choose the softPower
+softPower = 9
+adjacency = adjacency(vsd2, power = softPower, type = "signed")
+
+# Turn adjacency into topological overlap
+TOM = TOMsimilarity(adjacency, TOMType="signed")
+dissTOM = 1-TOM
+
+# Call the hierarchical clustering function
+geneTree = flashClust(as.dist(dissTOM), method="average")
+sizeGrWindow(12,9)
+plot(geneTree, xlab="", sub="", main= "Gene Clustering on TOM-based dissimilarity", labels= FALSE, hang=0.04)
+
+# Set module size
+minModuleSize = 40
+dynamicMods = cutreeDynamic(dendro= geneTree, distM= dissTOM, deepSplit=2, pamRespectsDendro= FALSE, minClusterSize = minModuleSize)
+dynamicColors= labels2colors(dynamicMods)
+table(dynamicColors)
+sizeGrWindow(8,6)
+plotDendroAndColors(geneTree, dynamicColors, "Dynamic Tree Cut", dendroLabels = FALSE, hang = 0.03, addGuide = TRUE, guideHang = 0.05, main = "Taxa dendrogram and module colors")
+
+# Calculate eigengenes
+MEList= moduleEigengenes(vsd2, colors= dynamicColors)
+MEs= MEList$eigengenes
+MEDiss= 1-cor(MEs)
+METree= flashClust(as.dist(MEDiss), method= "average")
+save(dynamicMods, MEList, MEs, MEDiss, METree, file= "Network_allSamples_signed_RLDfiltered.RData")
+plot(METree, main= "Clustering of module eigengenes", xlab= "", sub= "")
+
+# merge modules
+MEDissThres = 0.2
+abline(h=MEDissThres, col = "red")
+merge = mergeCloseModules(vsd2, dynamicColors, cutHeight= MEDissThres, verbose =3)
+mergedColors = merge$colors
+table(mergedColors)
+mergedMEs = merge$newMEs
+plotDendroAndColors(geneTree, cbind(dynamicColors, mergedColors), c("Dynamic Tree Cut", "Merged dynamic"), dendroLabels= FALSE, hang=0.03, addGuide= TRUE, guideHang=0.05)
+moduleColors = mergedColors
+colorOrder = c("grey", standardColors(50))
+moduleLabels = match(moduleColors, colorOrder)-1
+MEs = mergedMEs
+
+# Define number of genes and samples
+nGenes = ncol(vsd2)
+nSamples = nrow(vsd2)
+MEs0 = moduleEigengenes(vsd2, moduleColors)$eigengenes
+MEs = orderMEs(MEs0)
+moduleTraitCor = cor(MEs, datTraits, use= "p")
+moduleTraitPvalue = corPvalueStudent(moduleTraitCor, nSamples)
+textMatrix= paste(signif(moduleTraitCor, 2), "\n(", signif(moduleTraitPvalue, 1), ")", sep= "")
+dim(textMatrix)= dim(moduleTraitCor)
+par(mar= c(5, 12, 3, 3))
+plotEigengeneNetworks(MEs, "", marDendro = c(0,4,1,2), marHeatmap = c(3,4,1,2))
+labeledHeatmap(Matrix= moduleTraitCor, xLabels= names(datTraits), yLabels= names(MEs), ySymbols= names(MEs), colorLabels= FALSE, colors= blueWhiteRed(50), textMatrix= textMatrix, setStdMargins= FALSE, cex.text= 0.5, zlim= c(-1,1), main= paste("Module-trait relationships"))
+
+# Extract variable condition containing the condition column of datTrait
+condition<-as.data.frame(datTraits$Condition)
+names(condition)="condition"
+modNames = substring(names(MEs), 3)
+geneModuleMembership = as.data.frame(cor(vsd2, MEs, use = "p"))
+MMPvalue = as.data.frame(corPvalueStudent(as.matrix(geneModuleMembership), nSamples))
+names(geneModuleMembership) = paste("MM", modNames, sep="")
+names(MMPvalue) = paste("p.MM", modNames, sep="")
+geneTraitSignificance = as.data.frame(cor(vsd2, condition, use = "p"))
+GSPvalue = as.data.frame(corPvalueStudent(as.matrix(geneTraitSignificance), nSamples))
+names(geneTraitSignificance) = paste("GS.", names(condition), sep="")
+names(GSPvalue) = paste("p.GS.", names(condition), sep="")
+
+# Select module colour
+module = "magenta"
+column = match(module, modNames)
+moduleGenes = moduleColors==module
+verboseScatterplot(abs(geneModuleMembership[moduleGenes, column]),
+                   abs(geneTraitSignificance[moduleGenes, 1]),
+                   xlab = paste("Module Membership in", module, "module"),
+                   ylab = "Gene significance for condition",
+                   main = paste("Module membership vs. gene significance\n"),
+                   cex.main = 1.2, cex.lab = 1.2, cex.axis = 1.2, col = module)
+
+vsd3<-as.data.frame(vsd2)
+names(vsd3)
+names(vsd3)[moduleColors=="magenta"]
+
+# Create the starting data frame
+probes = names(vsd3)
+geneInfo0 = data.frame(Condition = probes, moduleColor = moduleColors, geneTraitSignificance, GSPvalue)
+
+# Order modules by their significance for condition
+modOrder = order(-abs(cor(MEs, condition, use = "p")))
+for (mod in 1:ncol(geneModuleMembership))
+{
+  oldNames = names(geneInfo0)
+  geneInfo0 = data.frame(geneInfo0, geneModuleMembership[, modOrder[mod]],
+                         MMPvalue[, modOrder[mod]]);
+  names(geneInfo0) = c(oldNames, paste("MM.", modNames[modOrder[mod]], sep=""),
+                       paste("p.MM.", modNames[modOrder[mod]], sep=""))
+}
+
+# Order the genes in the geneInfo variable first by module color, then by geneTraitSignificance
+geneOrder = order(geneInfo0$moduleColor, -abs(geneInfo0$GS.condition))
+geneInfo = geneInfo0[geneOrder, ]
+write.csv(geneInfo, file = "geneInfo.csv")
+
+# Recalculate module eigengens
+MEs = moduleEigengenes(vsd2, moduleColors)$eigengenes
+condition= as.data.frame(datTraits$Condition)
+names(condition) = "condition"
+MET = orderMEs(cbind(MEs, condition))
+sizeGrWindow(5,7.5);
+par(cex = 0.9)
+plotEigengeneNetworks(MET, "", marDendro = c(0,4,1,2), marHeatmap = c(3,4,1,2), cex.lab = 0.8, xLabelsAngle
+= 90)
+
+# Plot Network using VisANT
+TOM = TOMsimilarityFromExpr(vsd2, power=9)
+module = "magenta"
+probes = names(vsd3)
+inModule = (moduleColors==module)
+modProbes = probes[inModule]
+modTOM = TOM[inModule, inModule]
+dimnames(modTOM) = list(modProbes, modProbes)
+vis = exportNetworkToVisANT(modTOM, file = paste("VisANTInput-", module, ".txt", sep=""), weighted = TRUE, threshold = 0)
+
+# Select top 50 genes
+nTop = 50
+IMConn = softConnectivity(vsd2[, modProbes])
+top = (rank(-IMConn) <= nTop)
+vis = exportNetworkToVisANT(modTOM[top, top], file = paste("VisANTInput-", module, "-top50.txt", sep=""), weighted = TRUE, threshold = 0)
+
+#########################
+########CEMiTool#########
+#########################
+
+library("CEMiTool")
+
+# data.frame
+vsd<-read.csv("5000_GeneLists_Norm.csv", header=TRUE, row.names = 1)
+
+# Sample annotation
+annotation<-read.csv("samplesinfo3.csv", header=TRUE)
+cem <- cemitool(vsd, annotation, filter = FALSE)
+sample_annotation(cem, sample_name_column="SampleName",  class_column="Class") <- sample_annot
+
+# Obtain hub gene
+hubs <- get_hubs(cem,1)
+
+# Generate report
+generate_report(cem)
+write_files(cem)
+save_plots(cem, "all")
+
+# co-expression modules analysis
+cem <- cemitool(vsd, filter = FALSE)
+cem
+
+# number of modules
+nmodules(cem)
+
+# Inspect modules
+head(module_genes(cem))
+
+# top hub genes
+hubs <- get_hubs(cem,20)
+
+######################
+########COSEQ#########
+######################
+
+library(coseq)
+set.seed(1000)
+run <- coseq(vsd, K=2:40, alpha=0.05, iter=1000)
+conds <- metaData$Condition
+
+# Identify clusters
+class(run)
+run
+summary(run)
+
+# Generate figures
+plot(run, graphs="boxplots", conds=conds)
+plot(run, graphs="boxplots", conds=conds, collapse_reps = "sum")
+plot(run, graphs="profiles")
+
+# Output clusters
+labels <- clusters(run)
+table(labels)
+write.csv(labels, file="coseq_clusters.csv")
+
+# Transformed normalised profile
+transformed_counts<-tcounts(run)
+write.csv(transformed_counts, file="coseq_transformed_counts.csv")
+
+# Normalised profiles
+profiles_counts<-profiles(run)
+write.csv(profiles_counts, file="coseq_normalised_counts.csv")
+
+########################################
+########Enrichment analysis#############
+########################################
+
+library(DOSE)
+library(pathview)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(AnnotationHub)
+library(ensembldb)
+SIG0E_genes<-read.csv("sigGenes.csv", header = TRUE)
+sig0E_genes<-SIG0E_genes$Geneid
+ego <- enrichGO(gene = sig0E_genes, keyType = "SYMBOL", OrgDb = org.Hs.eg.db, ont = "ALL", pvalueCutoff=0.01, qvalueCutoff=0.01)
+cluster_summary <- data.frame(ego)
+write.csv(cluster_summary, "clusterProfiler.csv")
+dotplot(ego, showCategory=30)
+cnetplot(ego, foldChange=geneList)
